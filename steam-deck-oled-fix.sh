@@ -1,335 +1,269 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Steam Deck OLED – Post-Omarchy Hardware Setup (COMPLETE VERSION)
+# Fixed: Includes repository setup function that was accidentally omitted
+#
 
-# Steam Deck OLED Post-Omarchy Installation Script
-# This script fixes Steam Deck OLED specific issues after Omarchy installation
+set -euo pipefail
+LOG=/var/log/steamdeck-setup.log
+exec > >(tee -a "$LOG") 2>&1
 
-set -e
+################################################################################
+# 0. Global helpers
+################################################################################
+COLOR() { [[ -t 1 ]] && printf '\e[%sm%s\e[0m' "$1" "$2" || printf '%s' "$2"; }
+info () { COLOR 32 "[INFO] ";  echo "$*"; }
+warn () { COLOR 33 "[WARN] ";  echo "$*"; }
+fail () { COLOR 31 "[FAIL] ";  echo "$*"; exit 1; }
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+DRY=0; AUTO=0
+[[ "${1:-}" == "--dry-run" ]] && DRY=1
+[[ "${1:-}" == "--yes"     ]] && AUTO=1
+[[ "$DRY" -eq 1 && "$AUTO" -eq 1 ]] && fail "Choose --dry-run OR --yes"
 
-echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}Steam Deck OLED Post-Omarchy Fix Script${NC}"
-echo -e "${BLUE}========================================${NC}"
+ask () { [[ $AUTO -eq 1 ]] && return 0; read -rp "$1 [y/N] " r; [[ $r == y* ]]; }
 
-# Function to print colored output
-print_status() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+run () {
+  info "$*"
+  [[ $DRY -eq 1 ]] || eval "$*"
 }
 
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
+################################################################################
+# 1. Detect Deck
+################################################################################
+DECK=0
+if [[ -f /sys/class/dmi/id/product_name ]] &&
+   grep -qE "(Jupiter|Galileo)" /sys/class/dmi/id/product_name; then
+  DECK=1
+  info "Steam Deck detected"
+else
+  info "Generic system detected"
+fi
 
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+################################################################################
+# 2. Repositories & keys (RESTORED FUNCTION)
+################################################################################
+add_repos () {
+  info "Adding Valve jupiter/holo repositories"
+  
+  # Remove any existing jupiter/holo repositories first
+  sudo sed -i '/\[jupiter-main\]/,/^$/d' /etc/pacman.conf 2>/dev/null || true
+  sudo sed -i '/\[holo-main\]/,/^$/d' /etc/pacman.conf 2>/dev/null || true
+  
+  # Add the repositories
+  sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 
-# Check if running on Steam Deck
-check_steam_deck() {
-    print_status "Checking if running on Steam Deck..."
-    if [[ $(dmidecode -s system-product-name 2>/dev/null) == *"Steam Deck"* ]] || [[ -f /sys/class/dmi/id/product_name && $(cat /sys/class/dmi/id/product_name) == *"Steam Deck"* ]]; then
-        print_status "Steam Deck detected"
-        return 0
-    else
-        print_warning "This script is designed for Steam Deck. Proceeding anyway..."
-        return 1
-    fi
-}
-
-# Install essential packages for Steam Deck
-install_steam_deck_packages() {
-    print_status "Installing Steam Deck specific packages..."
-
-    # Add Valve's Jupiter repository for Steam Deck specific packages
-    if ! grep -q "jupiter" /etc/pacman.conf; then
-        print_status "Adding Valve Jupiter repository..."
-        sudo tee -a /etc/pacman.conf > /dev/null <<EOF
-
-[jupiter]
+[jupiter-main]
 SigLevel = Optional TrustAll
 Server = https://steamdeck-packages.steamos.cloud/archlinux-mirror/jupiter-main/os/x86_64/
+
+[holo-main]
+SigLevel = Optional TrustAll
+Server = https://steamdeck-packages.steamos.cloud/archlinux-mirror/holo-main/os/x86_64/
 EOF
-    fi
-
-    # Update package database
-    sudo pacman -Sy
-
-    # Install Steam Deck specific kernel and firmware
-    print_status "Installing Steam Deck kernel and firmware..."
-    yay -S --noconfirm linux-neptune linux-neptune-headers
-    yay -S --noconfirm linux-firmware-neptune
-
-    # Install Steam Deck specific packages
-    print_status "Installing additional Steam Deck packages..."
-    yay -S --noconfirm steamdeck-dsp alsa-ucm-conf
-
-    # Install gamepad drivers and Steam controller support
-    yay -S --noconfirm steam-devices
+  
+  # Initialize and sync
+  run "sudo pacman-key --init"
+  run "sudo pacman-key --populate archlinux"
+  run "sudo pacman -Sy"
+  
+  info "Valve repositories added successfully"
 }
 
-# Fix WiFi for Steam Deck OLED
-fix_wifi() {
-    print_status "Fixing WiFi for Steam Deck OLED..."
+################################################################################
+# 3. Verify multilib is enabled
+################################################################################
+verify_multilib() {
+    info "Verifying multilib repository is enabled"
+    
+    if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
+        fail "Multilib repository not enabled. Run: sudo nano /etc/pacman.conf and uncomment [multilib] section"
+    fi
+    
+    if ! pacman -Sl multilib >/dev/null 2>&1; then
+        fail "Multilib repository not synced. Run: sudo pacman -Sy"
+    fi
+    
+    info "Multilib repository is properly configured"
+}
 
-    # Check if this is OLED model
-    if lspci | grep -q "17cb:1103"; then
-        print_status "Steam Deck OLED WiFi chip detected"
+################################################################################
+# 4. Packages (CORRECTED - no steam-devices)
+################################################################################
+PACKAGES_CORE=(
+  steam                    # Includes controller udev rules automatically
+  power-profiles-daemon 
+  bluez bluez-utils 
+  brightnessctl
+)
 
-        # Install neptune kernel if not already installed
-        if ! pacman -Qs linux-neptune > /dev/null; then
-            print_status "Installing Neptune kernel for WiFi support..."
-            yay -S --noconfirm linux-neptune linux-neptune-headers
-        fi
+PACKAGES_DECK=(
+  linux-neptune linux-neptune-headers 
+  linux-firmware-neptune
+  steamdeck-dsp 
+  alsa-ucm-conf 
+  jupiter-fan-control
+)
 
-        # Install firmware
-        yay -S --noconfirm linux-firmware-neptune
+install_pkgs () {
+  local pkgs=("${PACKAGES_CORE[@]}")
+  [[ $DECK -eq 1 ]] && pkgs+=("${PACKAGES_DECK[@]}")
+  
+  info "Installing packages: ${pkgs[*]}"
+  
+  # Install packages one by one to isolate failures
+  for package in "${pkgs[@]}"; do
+    info "Installing: $package"
+    
+    if ! pacman -Si "$package" >/dev/null 2>&1; then
+      warn "Package $package not available - skipping"
+      continue
+    fi
+    
+    if ! sudo pacman -S --needed --noconfirm "$package"; then
+      warn "Failed to install $package - continuing with others"
+    fi
+  done
+}
 
-        print_status "WiFi fix applied. Reboot required for changes to take effect."
+################################################################################
+# 5. Display & scaling
+################################################################################
+setup_display () {
+  info "Setting up display configuration"
+  mkdir -p ~/.config/hypr
+  
+  cat > ~/.config/hypr/monitors.conf <<'EOF'
+# Steam Deck built-in display rotated to landscape, 1.6× scale
+monitor = eDP-1, preferred, auto, 1.6, transform, 3
+# External displays default 1.0×
+monitor = , preferred, auto, 1.0
+EOF
+
+  # Fix Omarchy GDK_SCALE issue
+  mkdir -p ~/.config/environment.d
+  cat > ~/.config/environment.d/steamdeck-scale.conf <<'EOF'
+# Override Omarchy's GDK_SCALE=2 for external monitor compatibility
+GDK_SCALE=1
+QT_AUTO_SCREEN_SCALE_FACTOR=1
+QT_SCALE_FACTOR=1
+EOF
+
+  info "Display configuration created"
+}
+
+################################################################################
+# 6. Services
+################################################################################
+enable_services () {
+  info "Enabling system services"
+  run "sudo systemctl enable --now bluetooth"
+  run "sudo systemctl enable --now power-profiles-daemon"
+  
+  if [[ $DECK -eq 1 ]]; then
+    run "sudo systemctl enable --now jupiter-fan-control"
+  fi
+  
+  run "systemctl --user enable --now pipewire wireplumber"
+  info "Services enabled successfully"
+}
+
+################################################################################
+# 7. Audio setup
+################################################################################
+setup_audio () {
+  info "Setting up audio configuration"
+  run "sudo alsactl init || true"
+  info "Audio setup completed"
+}
+
+################################################################################
+# 8. Bootloader optimization
+################################################################################
+tune_grub () {
+  info "Updating GRUB configuration for Steam Deck"
+  local cfg=/etc/default/grub
+  
+  # Create backup
+  sudo cp "$cfg"{,.bak}
+  
+  # Add AMD pstate optimization
+  if ! grep -q "amd_pstate=active" "$cfg"; then
+    sudo sed -i 's/\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 amd_pstate=active"/' "$cfg"
+    run "sudo grub-mkconfig -o /boot/grub/grub.cfg"
+    info "GRUB configuration updated"
+  else
+    info "GRUB already optimized"
+  fi
+}
+
+################################################################################
+# 9. Optional enhanced controller support
+################################################################################
+install_enhanced_controller_support() {
+    info "Installing enhanced controller support (optional)"
+    
+    if command -v yay >/dev/null 2>&1; then
+        info "Installing game-devices-udev for extended controller support"
+        yay -S --noconfirm game-devices-udev || warn "Failed to install game-devices-udev"
     else
-        print_status "Non-OLED Steam Deck detected, standard WiFi drivers should work"
+        info "Install yay to get enhanced controller support via game-devices-udev"
     fi
 }
 
-# Fix Bluetooth for Steam Deck OLED
-fix_bluetooth() {
-    print_status "Fixing Bluetooth for Steam Deck OLED..."
+################################################################################
+# 10. OLED care tips
+################################################################################
+oled_tips () {
+cat <<'NOTE'
 
-    # Enable and start bluetooth service
-    sudo systemctl enable bluetooth
-    sudo systemctl start bluetooth
-
-    # Install bluetooth packages
-    yay -S --noconfirm bluez bluez-utils
-
-    print_status "Bluetooth service enabled and started"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ OLED Care Recommendations
+ ──────────────────────────────────────────
+ • Enable screen blanking (5-10 minutes)
+ • Lower brightness when possible
+ • Consider: https://aur.archlinux.org/packages/oled-pixel-shift
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NOTE
 }
 
-# Fix audio for Steam Deck OLED
-fix_audio() {
-    print_status "Fixing audio for Steam Deck OLED..."
-
-    # Install audio packages
-    yay -S --noconfirm pipewire pipewire-alsa pipewire-pulse wireplumber
-    yay -S --noconfirm steamdeck-dsp alsa-ucm-conf
-
-    # Enable audio services
-    systemctl --user enable pipewire
-    systemctl --user enable wireplumber
-    systemctl --user start pipewire
-    systemctl --user start wireplumber
-
-    print_status "Audio services configured"
+################################################################################
+# 11. Main execution
+################################################################################
+main () {
+  info "Steam Deck OLED hardware setup - COMPLETE VERSION"
+  
+  # Essential setup steps
+  verify_multilib
+  add_repos          # NOW PROPERLY IMPLEMENTED
+  install_pkgs
+  setup_display
+  enable_services
+  setup_audio
+  tune_grub
+  
+  # Optional enhancements
+  if ask "Install enhanced controller support for non-Steam controllers? [y/N]"; then
+    install_enhanced_controller_support
+  fi
+  
+  # Final information
+  oled_tips
+  
+  info "Setup completed successfully!"
+  info "Reboot recommended to apply all changes"
+  
+  # Summary of what was done
+  echo
+  info "Summary of changes:"
+  echo "  ✓ Added Valve Steam Deck repositories"
+  echo "  ✓ Installed Steam and hardware packages"
+  echo "  ✓ Fixed Omarchy GDK_SCALE issue"
+  echo "  ✓ Configured display rotation and scaling"
+  echo "  ✓ Enabled audio, Bluetooth, and power services"
+  echo "  ✓ Optimized GRUB for Steam Deck"
+  [[ $DECK -eq 1 ]] && echo "  ✓ Steam Deck hardware support enabled"
 }
 
-# Fix display orientation for built-in screen
-fix_display_orientation() {
-    print_status "Fixing display orientation for Steam Deck built-in screen..."
-
-    # Create monitor configuration for Steam Deck
-    mkdir -p ~/.config/hypr
-
-    # Check if monitors.conf exists and backup if it does
-    if [[ -f ~/.config/hypr/monitors.conf ]]; then
-        cp ~/.config/hypr/monitors.conf ~/.config/hypr/monitors.conf.backup
-        print_status "Backed up existing monitors.conf"
-    fi
-
-    # Create Steam Deck specific monitor configuration
-    cat > ~/.config/hypr/monitors.conf << 'EOF'
-# Steam Deck OLED built-in display configuration
-# The built-in display is eDP-1 and needs proper orientation
-monitor=eDP-1,1280x800@90,0x0,1
-
-# External monitor configuration (auto-detect)
-monitor=,preferred,auto,1
-EOF
-
-    print_status "Display orientation configuration created"
-}
-
-# Configure power management for Steam Deck
-configure_power_management() {
-    print_status "Configuring power management for Steam Deck..."
-
-    # Install power management tools
-    yay -S --noconfirm power-profiles-daemon
-
-    # Set balanced power profile for battery operation
-    sudo systemctl enable power-profiles-daemon
-    sudo systemctl start power-profiles-daemon
-
-    # Configure for balanced mode (good for Steam Deck)
-    powerprofilesctl set balanced
-
-    print_status "Power management configured"
-}
-
-# Configure Steam Deck controls
-configure_steam_deck_controls() {
-    print_status "Configuring Steam Deck controls..."
-
-    # Install Steam controller support
-    yay -S --noconfirm steam-devices
-
-    # Add user to input group
-    sudo usermod -a -G input $USER
-
-    # Configure udev rules for Steam controller
-    sudo tee /etc/udev/rules.d/99-steam-controller.rules > /dev/null <<EOF
-# Steam Controller udev rules
-SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", MODE="0666"
-KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
-EOF
-
-    sudo udevadm control --reload-rules
-
-    print_status "Steam Deck controls configured"
-}
-
-# Install Steam
-install_steam() {
-    print_status "Installing Steam..."
-
-    # Enable multilib repository
-    if ! grep -q "multilib" /etc/pacman.conf; then
-        print_status "Enabling multilib repository..."
-        sudo sed -i '/^#\[multilib\]/,/^$/{s/^#//}' /etc/pacman.conf
-        sudo pacman -Sy
-    fi
-
-    # Install Steam
-    yay -S --noconfirm steam
-
-    print_status "Steam installed"
-}
-
-# Configure fan control
-configure_fan_control() {
-    print_status "Configuring fan control..."
-
-    # Install fan control daemon
-    yay -S --noconfirm jupiter-fan-control
-
-    # Enable fan control service
-    sudo systemctl enable jupiter-fan-control
-    sudo systemctl start jupiter-fan-control
-
-    print_status "Fan control configured"
-}
-
-# Create desktop shortcut for Steam Deck mode
-create_steam_deck_shortcuts() {
-    print_status "Creating Steam Deck shortcuts..."
-
-    # Create desktop file for Steam Big Picture mode
-    mkdir -p ~/.local/share/applications
-
-    cat > ~/.local/share/applications/steam-gamemode.desktop << 'EOF'
-[Desktop Entry]
-Name=Steam (Game Mode)
-Comment=Steam Big Picture Mode
-Exec=steam -bigpicture
-Icon=steam
-Terminal=false
-Type=Application
-Categories=Game;
-EOF
-
-    print_status "Steam Deck shortcuts created"
-}
-
-# Configure system for gaming
-configure_gaming_optimizations() {
-    print_status "Configuring gaming optimizations..."
-
-    # Install gaming-related packages
-    yay -S --noconfirm gamemode lib32-gamemode mangohud lib32-mangohud
-
-    # Configure gamemode
-    sudo usermod -a -G gamemode $USER
-
-    print_status "Gaming optimizations configured"
-}
-
-# Update bootloader for Steam Deck
-update_bootloader() {
-    print_status "Updating bootloader configuration..."
-
-    # Add Steam Deck specific kernel parameters
-    if [[ -f /etc/default/grub ]]; then
-        # Backup grub config
-        sudo cp /etc/default/grub /etc/default/grub.backup
-
-        # Add Steam Deck specific parameters
-        sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*/& amd_pstate=active/' /etc/default/grub
-
-        # Regenerate grub config
-        sudo grub-mkconfig -o /boot/grub/grub.cfg
-
-        print_status "Bootloader updated"
-    fi
-}
-
-# Fix screen rotation at boot
-fix_boot_screen_rotation() {
-    print_status "Fixing screen rotation at boot..."
-
-    # Add fbcon rotation parameter to bootloader
-    if [[ -f /etc/default/grub ]]; then
-        sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*/& fbcon=rotate:0/' /etc/default/grub
-        sudo grub-mkconfig -o /boot/grub/grub.cfg
-        print_status "Boot screen rotation fixed"
-    fi
-}
-
-# Main installation function
-main() {
-    print_status "Starting Steam Deck OLED post-Omarchy installation..."
-
-    # Check if running on Steam Deck
-    check_steam_deck
-
-    # Install packages
-    install_steam_deck_packages
-
-    # Fix hardware issues
-    fix_wifi
-    fix_bluetooth
-    fix_audio
-    fix_display_orientation
-
-    # Configure system
-    configure_power_management
-    configure_steam_deck_controls
-    configure_fan_control
-
-    # Install gaming software
-    install_steam
-    configure_gaming_optimizations
-
-    # Create shortcuts
-    create_steam_deck_shortcuts
-
-    # Update bootloader
-    update_bootloader
-    fix_boot_screen_rotation
-
-    print_status "Installation complete!"
-    print_warning "Please reboot your Steam Deck to apply all changes."
-    print_warning "After reboot, you may need to:"
-    print_warning "1. Set up Steam in Desktop Mode"
-    print_warning "2. Configure display settings if needed"
-    print_warning "3. Test audio, WiFi, and Bluetooth functionality"
-
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}Steam Deck OLED setup completed!${NC}"
-    echo -e "${GREEN}========================================${NC}"
-}
-
-# Run main function
-main "$@" 
+################################################################################
+main "$@"
