@@ -1,6 +1,6 @@
 #!/bin/sh -e
 
-. ../linutil/core/tabs/common-script.sh
+. ./common-script.sh
 
 detectSteamDeck() {
     STEAM_DECK=0
